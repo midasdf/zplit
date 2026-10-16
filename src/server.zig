@@ -142,6 +142,57 @@ pub const PaneState = struct {
                 // Respond as VT220-compatible terminal (same as zellij): ESC[?62;4c
                 _ = self.pty.write("\x1b[?62;4c") catch {};
             },
+            .device_secondary_attributes => {
+                // DA2 (ESC > c) — keep the same VT220 family as the DA1 reply above
+                _ = self.pty.write("\x1b[>62;1;0c") catch {};
+            },
+            .notification_request => {
+                // DSR 5n: the reply is the request itself
+                _ = self.pty.write("\x1b[5n") catch {};
+            },
+            .request_keyboard_flags => {
+                // CSI ? u — report "no extended flags" (bit 1 = plain CSI u)
+                _ = self.pty.write("\x1b[?1u") catch {};
+            },
+            .query_palette_color => |idx| {
+                // OSC 10;? / 11;? / 12;? — nvim stalls and prints E1568 if nothing answers.
+                // Reply with xterm's 4-hex-digit form so nvim can parse the colour.
+                // Note: replying pure black makes nvim treat it as "no colour" (E1568).
+                var buf: [32]u8 = undefined;
+                const response = std.fmt.bufPrint(&buf, "\x1b]{d};rgb:cccc/eeee/ffff\x07", .{idx}) catch return;
+                _ = self.pty.write(response) catch {};
+            },
+            .request_mode_test => |mode| {
+                // CSI ? Ps $ p — report "not supported" so the app stops waiting
+                var buf: [32]u8 = undefined;
+                const response = std.fmt.bufPrint(&buf, "\x1b[?{d};0p", .{mode}) catch return;
+                _ = self.pty.write(response) catch {};
+            },
+            .request_window_op => |op| {
+                // CSI Ps t — geometry/title requests (nvim, tmux)
+                const rows = self.grid.getRows();
+                const cols = self.grid.getCols();
+                var buf: [48]u8 = undefined;
+                switch (op) {
+                    18 => {
+                        const response = std.fmt.bufPrint(&buf, "\x1b[18;{d};{d}t", .{ rows, cols }) catch return;
+                        _ = self.pty.write(response) catch {};
+                    },
+                    19 => {
+                        // Pixel size — approximate with a 8x18 cell
+                        const response = std.fmt.bufPrint(&buf, "\x1b[19;{d};{d}t", .{
+                            @as(u32, rows) * 18, @as(u32, cols) * 8,
+                        }) catch return;
+                        _ = self.pty.write(response) catch {};
+                    },
+                    21 => {
+                        const t: []const u8 = self.title[0..self.title_len];
+                        const response = std.fmt.bufPrint(&buf, "\x1b]21;{s}\x07", .{t}) catch return;
+                        _ = self.pty.write(response) catch {};
+                    },
+                    else => {}, // 22/23/24 set a title — no reply
+                }
+            },
             else => {
                 if (self.grid.applyEvent(ev)) |cpr| {
                     var cpr_buf: [32]u8 = undefined;
@@ -781,6 +832,9 @@ pub const Server = struct {
 
         var grid = try grid_mod.Grid.init(self.allocator, init_cols, init_rows);
         errdefer grid.deinit();
+        // Bound the rows the grid keeps above the viewport (pane resizes push
+        // rows into scrollback; without a cap they would grow unboundedly).
+        grid.max_scrollback_lines = @as(usize, sb_lines);
 
         const state = try self.allocator.create(PaneState);
         errdefer self.allocator.destroy(state);
@@ -881,6 +935,7 @@ pub const Server = struct {
             return; // Error reading — HUP handler will clean up
         };
         if (n == 0) return; // EOF — child process exited; EPOLLHUP handler will clean up
+
 
         // Feed bytes through VT parser and update pane screen buffer
         const was_in_alt = state.grid.in_alt_screen;

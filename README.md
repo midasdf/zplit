@@ -1,6 +1,6 @@
 # zplit
 
-**A terminal multiplexer under 100KB.**
+**A terminal multiplexer under 250KB.**
 
 Written in Zig. Zero dependencies. Statically linked. Light enough to run where others won't.
 
@@ -12,13 +12,13 @@ Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 
 | | zplit | tmux 3.6a | zellij 0.43.1 |
 |---|---|---|---|
-| Binary | **91 KB** | 1.3 MB | 44 MB |
+| Binary | **229 KB** | 1.3 MB | 44 MB |
 | Language | Zig | C | Rust + WASM |
 | Runtime deps | **0** | libevent, ncurses, etc. | curl, glibc, zlib, etc. |
 | Text reflow | Yes | No | Yes |
 | CJK width | Yes | Yes | Yes |
 
-> zplit binary = static aarch64 `ReleaseSmall` (92,848 bytes). tmux/zellij = installed size from `pacman -Si`/`pacman -Qi` on aarch64.
+> zplit binary = static aarch64 `ReleaseSmall` (234,512 bytes). tmux/zellij = installed size from `pacman -Si`/`pacman -Qi` on aarch64.
 
 ## Features
 
@@ -30,6 +30,7 @@ Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 - **Scrollback** — preserved on screen clear, scroll mode to browse history
 - **CJK support** — fullwidth characters, Japanese input (fcitx5)
 - **Terminal emulation** — SGR colors (256 + RGB), alternate screen, DA1/DSR
+- **Ncurses support** — colon-form SGR, scroll regions, `ESC 7`/`ESC 8` save-and-restore, absolute cursor addressing, and terminal query replies
 - **Alternate screen** — vim, htop, etc. restore correctly on exit
 - **Single binary** — client/server in one executable, zero runtime dependencies
 
@@ -42,7 +43,14 @@ Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 git clone https://github.com/midasdf/zplit.git
 cd zplit
 zig build -Doptimize=ReleaseSmall
-# Binary at zig-out/bin/zplit (<100KB)
+# Binary at zig-out/bin/zplit (~230KB)
+```
+
+#### System-wide
+
+```bash
+zig build -Doptimize=ReleaseSmall
+install -m 755 ./zig-out/bin/zplit $HOME/.local/bin/zplit
 ```
 
 ### Cross-compile for ARM
@@ -116,7 +124,7 @@ Single binary acts as both client and server, connected via Unix domain socket.
 | | | Screen compositor |
 | | | Tab / Pane tree |
 
-17 source files, ~7400 lines of Zig. No external dependencies.
+18 source files, ~9700 lines of Zig. No external dependencies.
 
 ## License
 

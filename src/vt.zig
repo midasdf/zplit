@@ -71,6 +71,7 @@ pub const Event = union(enum) {
     cursor_position_report, // DSR: app requests cursor position (CSI 6n)
     device_attributes_request, // DA1: app requests terminal identity (CSI c / CSI 0c)
     linefeed,
+    next_line, // ESC E: linefeed + carriage return
     carriage_return,
     backspace,
     tab,
@@ -78,6 +79,24 @@ pub const Event = union(enum) {
     set_title: TitleData,
     alt_screen: bool,
     cursor_visible: bool,
+
+    // ── Cursor save / absolute positioning ─────────────────────────────────
+    cursor_save, // ESC[s (ANSI.SYS SCP)
+    cursor_restore, // ESC[u (ANSI.SYS RCP)
+    cursor_col_abs: u16, // CSI Ps `  / CSI Ps G  (HPA)
+    cursor_row_abs: u16, // CSI Ps d  (VPA)
+
+    // ── Mode changes ───────────────────────────────────────────────────────
+    set_autowrap: bool, // CSI ?7h / CSI ?7l  (DECAWM)
+    set_origin: bool, // CSI ?36h / CSI ?36l (DECOM)
+
+    // ── Terminal queries (the app waits for a reply) ───────────────────────
+    notification_request, // CSI 5 n  (DSR notification)
+    device_secondary_attributes, // CSI > c (DA2)
+    request_mode_test: u16, // CSI ? Ps $ p  (mode test)
+    request_keyboard_flags, // CSI ? u (KBD flags query)
+    request_window_op: u8, // CSI Ps t (window/cursor geometry)
+    query_palette_color: u8, // OSC 10;? / 11;? / 12;? (palette query)
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -106,6 +125,8 @@ pub const Parser = struct {
     param_idx: usize = 0,
     has_params: u16 = 0, // bitmask: bit N set if param N had at least one digit
     private: bool = false, // '?' or '>' prefix seen
+    priv_marker: u8 = 0, // which private marker was seen ('?' or '>')
+    csi_inter: u8 = 0, // first intermediate byte of the CSI (0 = none)
 
     // OSC accumulator
     osc_buf: [OSC_BUF_LEN]u8 = undefined,
@@ -125,6 +146,8 @@ pub const Parser = struct {
         self.param_idx = 0;
         self.has_params = 0;
         self.private = false;
+        self.priv_marker = 0;
+        self.csi_inter = 0;
     }
 
     fn getParam(self: *const Parser, idx: usize, default: u16) u16 {
@@ -243,6 +266,26 @@ pub const Parser = struct {
                         self.osc_len = 0;
                         return null;
                     },
+                    '7' => {
+                        // ESC 7 (DEC SC): save cursor position
+                        self.state = .ground;
+                        return .cursor_save;
+                    },
+                    '8' => {
+                        // ESC 8 (DEC RC): restore cursor position
+                        self.state = .ground;
+                        return .cursor_restore;
+                    },
+                    'D' => {
+                        // Index: move the cursor down one line, scrolling at the margin
+                        self.state = .ground;
+                        return .linefeed;
+                    },
+                    'E' => {
+                        // Next line: Index + carriage return
+                        self.state = .ground;
+                        return .next_line;
+                    },
                     'M' => {
                         self.state = .ground;
                         return .{ .scroll_down = 1 };
@@ -277,6 +320,7 @@ pub const Parser = struct {
                 switch (byte) {
                     '?' , '>' => {
                         self.private = true;
+                        self.priv_marker = byte;
                         self.state = .csi_param;
                         return null;
                     },
@@ -286,12 +330,14 @@ pub const Parser = struct {
                         self.has_params |= 1; // mark param 0
                         return null;
                     },
-                    ';' => {
+                    ';', ':' => {
+                        // ':' is the alternate (sub)parameter separator; treat it like ';'
                         self.state = .csi_param;
-                        self.param_idx += 1;
+                        if (self.param_idx + 1 < MAX_PARAMS) self.param_idx += 1;
                         return null;
                     },
                     0x20...0x2f => {
+                        self.csi_inter = byte;
                         self.state = .csi_intermediate;
                         return null;
                     },
@@ -317,7 +363,9 @@ pub const Parser = struct {
                         self.has_params |= @as(u16, 1) << @intCast(self.param_idx);
                         return null;
                     },
-                    ';' => {
+                    ';', ':' => {
+                        // ':' is the alternate (sub)parameter separator used by ncurses and
+                        // many modern apps (CSI 38:2:r:g:b m). Treat it like ';'.
                         if (self.param_idx + 1 < MAX_PARAMS) {
                             self.param_idx += 1;
                         }
@@ -325,6 +373,7 @@ pub const Parser = struct {
                         return null;
                     },
                     0x20...0x2f => {
+                        if (self.csi_inter == 0) self.csi_inter = byte;
                         self.state = .csi_intermediate;
                         return null;
                     },
@@ -343,7 +392,9 @@ pub const Parser = struct {
             .csi_intermediate => {
                 if (byte >= 0x40 and byte <= 0x7e) {
                     self.state = .ground;
-                    // dispatch ignored for now (rare sequences)
+                    return self.dispatchCsi(byte);
+                } else if (byte >= 0x20 and byte <= 0x2f) {
+                    // Additional intermediate byte — keep the first one.
                 } else if (byte == 0x1b) {
                     self.state = .ground;
                 }
@@ -403,6 +454,9 @@ pub const Parser = struct {
         if (self.private) {
             return self.dispatchCsiPrivate(final);
         }
+        if (self.csi_inter != 0) {
+            return self.dispatchCsiInter(final);
+        }
         switch (final) {
             // Cursor up
             'A' => return .{ .cursor_move = .{
@@ -449,6 +503,21 @@ pub const Parser = struct {
             'S' => return .{ .scroll_up = self.getParam(0, 1) },
             // Scroll down
             'T' => return .{ .scroll_down = self.getParam(0, 1) },
+            // Horizontal absolute position (HPA) — 1-based → 0-based
+            '`', 'G' => {
+                const col = self.getParam(0, 1);
+                return .{ .cursor_col_abs = if (col > 0) col - 1 else 0 };
+            },
+            // Vertical absolute position (VPA) — 1-based → 0-based
+            'd' => {
+                const row = self.getParam(0, 1);
+                return .{ .cursor_row_abs = if (row > 0) row - 1 else 0 };
+            },
+            // Save / restore cursor (ANSI.SYS SCP / RCP)
+            's' => return .cursor_save,
+            'u' => return .cursor_restore,
+            // Window/cursor geometry query — the app waits for a reply
+            't' => return .{ .request_window_op = @intCast(self.rawParam(0)) },
             // Set scrolling region
             'r' => {
                 const top = self.getParam(0, 1);
@@ -462,7 +531,9 @@ pub const Parser = struct {
             'm' => return .{ .sgr = self.parseSgr() },
             // DSR (Device Status Report) — CSI 6 n = request cursor position
             'n' => {
-                if (self.rawParam(0) == 6) return .cursor_position_report;
+                const p = self.rawParam(0);
+                if (p == 6) return .cursor_position_report;
+                if (p == 5) return .notification_request; // ESC[5n echoes back
                 return null;
             },
             // DA1 (Device Attributes) — CSI c or CSI 0 c
@@ -477,17 +548,59 @@ pub const Parser = struct {
 
     fn dispatchCsiPrivate(self: *Parser, final: u8) ?Event {
         const p = self.rawParam(0);
+
+        // CSI ? Ps $ p — mode test: report "not supported" so the app stops waiting.
+        if (self.csi_inter == '$' and final == 'p') {
+            return .{ .request_mode_test = p };
+        }
+
+        // DA2 / DA3 (CSI > c, CSI > 4 ; c)
+        if (self.priv_marker == '>' and final == 'c') {
+            if (p == 4) return null; // DA3 — no reply needed
+            return .device_secondary_attributes;
+        }
+
+        // DA1 with parameters (CSI ? 1 ; 2 c) — same reply as bare CSI c
+        if (self.priv_marker == '?' and final == 'c') {
+            return .device_attributes_request;
+        }
+
+        // Keyboard flags query (CSI ? u)
+        if (final == 'u' and self.has_params == 0) {
+            return .request_keyboard_flags;
+        }
+
         switch (final) {
             'h' => switch (p) {
-                1049, 1047, 47 => return .{ .alt_screen = true },
+                1049, 1047, 47, 1048 => return .{ .alt_screen = true },
                 25 => return .{ .cursor_visible = true },
+                7 => return .{ .set_autowrap = true },
+                36 => return .{ .set_origin = true },
                 else => return null,
             },
             'l' => switch (p) {
-                1049, 1047, 47 => return .{ .alt_screen = false },
+                1049, 1047, 47, 1048 => return .{ .alt_screen = false },
                 25 => return .{ .cursor_visible = false },
+                7 => return .{ .set_autowrap = false },
+                36 => return .{ .set_origin = false },
                 else => return null,
             },
+            else => return null,
+        }
+    }
+
+    /// CSI with an intermediate byte (CSI Ps SP q, CSI Ps $ p, …)
+    fn dispatchCsiInter(self: *Parser, final: u8) ?Event {
+        switch (self.csi_inter) {
+            ' ' => switch (final) {
+                'q' => return null, // DECSCSR cursor style — accepted, no reply
+                else => return null,
+            },
+            '$' => switch (final) {
+                'p' => return .{ .request_mode_test = self.rawParam(0) },
+                else => return null,
+            },
+            '!' => return null, // DECRPS — accepted, no reply
             else => return null,
         }
     }
@@ -604,6 +717,15 @@ pub const Parser = struct {
 
     fn dispatchOsc(self: *Parser) ?Event {
         const buf = self.osc_buf[0..self.osc_len];
+        // Palette colour queries: ESC ] 10 ; ? BEL / 11 ; ? / 12 ; ? — the app waits for a
+        // reply (nvim prints "E1568: Terminal did not respond to DSR request for 'background'
+        // color" when nothing answers).
+        if (buf.len == 4 and buf[2] == ';' and buf[3] == '?' and
+            buf[0] >= '0' and buf[0] <= '9' and buf[1] >= '0' and buf[1] <= '9')
+        {
+            const num: usize = @as(usize, buf[0] - '0') * 10 + @as(usize, buf[1] - '0');
+            if (num >= 10 and num <= 12) return .{ .query_palette_color = @intCast(num) };
+        }
         // Expect "0;" or "2;" prefix
         if (buf.len < 2) return null;
         if ((buf[0] == '0' or buf[0] == '2') and buf[1] == ';') {
@@ -940,4 +1062,170 @@ test "parser returns to ground after sequence" {
         .print => |c| try std.testing.expectEqual(@as(u21, 'X'), c),
         else => return error.WrongEvent,
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tests for the sequences nvim/vis/vim rely on
+// ─────────────────────────────────────────────────────────────
+
+test "colon-separated SGR (CSI 38:2:r:g:b m)" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[38:2:200:211:245m");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .sgr => |params| {
+            if (params.fg == null) return error.WrongColor;
+            switch (params.fg.?) {
+                .rgb => |c| {
+                    try std.testing.expectEqual(@as(u8, 200), c.r);
+                    try std.testing.expectEqual(@as(u8, 211), c.g);
+                    try std.testing.expectEqual(@as(u8, 245), c.b);
+                },
+                else => return error.WrongColor,
+            }
+        },
+        else => return error.WrongEvent,
+    }
+}
+
+test "colon SGR leaves no printable garbage" {
+    var p = Parser.init();
+    // After the SGR, the next byte must print as 'A' (previously the tail of the
+    // colon form leaked onto the screen as text).
+    _ = feedAll(&p, "\x1b[38:2:1:2:3m");
+    const ev = p.feed('A');
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .print => |c| try std.testing.expectEqual(@as(u21, 'A'), c),
+        else => return error.WrongEvent,
+    }
+}
+
+test "VPA CSI 20d" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[20d");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .cursor_row_abs => |row| try std.testing.expectEqual(@as(u16, 19), row),
+        else => return error.WrongEvent,
+    }
+}
+
+test "HPA CSI 65`" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[65`");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .cursor_col_abs => |col| try std.testing.expectEqual(@as(u16, 64), col),
+        else => return error.WrongEvent,
+    }
+}
+
+test "save/restore cursor CSI s / CSI u" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[s");
+    try std.testing.expectEqual(Event.cursor_save, ev.?);
+    const ev2 = feedAll(&p, "\x1b[u");
+    try std.testing.expectEqual(Event.cursor_restore, ev2.?);
+}
+
+test "autowrap off CSI ?7l" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[?7l");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .set_autowrap => |on| try std.testing.expect(!on),
+        else => return error.WrongEvent,
+    }
+}
+
+test "mode test CSI ?69$ p answers" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[?69$p");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .request_mode_test => |m| try std.testing.expectEqual(@as(u16, 69), m),
+        else => return error.WrongEvent,
+    }
+}
+
+test "DA2 CSI > c" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[>c");
+    try std.testing.expectEqual(Event.device_secondary_attributes, ev.?);
+}
+
+test "DSR 5n notification" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[5n");
+    try std.testing.expectEqual(Event.notification_request, ev.?);
+}
+
+test "DA1 variant CSI ?1;2c" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[?1;2c");
+    try std.testing.expectEqual(Event.device_attributes_request, ev.?);
+}
+
+test "keyboard flags CSI ? u" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[?u");
+    try std.testing.expectEqual(Event.request_keyboard_flags, ev.?);
+}
+
+test "background colour query OSC 11;?" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b]11;?\x07");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .query_palette_color => |idx| try std.testing.expectEqual(@as(u8, 11), idx),
+        else => return error.WrongEvent,
+    }
+}
+
+test "cursor style CSI 1 SP q is consumed" {
+    var p = Parser.init();
+    _ = feedAll(&p, "\x1b[1 q");
+    // The following byte must print normally (no leaked 'q')
+    const ev = p.feed('A');
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .print => |c| try std.testing.expectEqual(@as(u21, 'A'), c),
+        else => return error.WrongEvent,
+    }
+}
+
+test "window geometry CSI 18t" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[18t");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .request_window_op => |op| try std.testing.expectEqual(@as(u8, 18), op),
+        else => return error.WrongEvent,
+    }
+}
+
+test "many empty params do not overflow" {
+    var p = Parser.init();
+    const ev = feedAll(&p, "\x1b[;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;A");
+    try std.testing.expect(ev != null);
+    switch (ev.?) {
+        .cursor_move => |cm| try std.testing.expectEqual(@as(i16, -1), cm.row),
+        else => return error.WrongEvent,
+    }
+}
+
+test "nvim startup prefix emits palette query" {
+    var p = Parser.init();
+    const prefix = "\x1b[?2004h\x1b[?1049h\x1b[?1h\x1b[H\x1b[2J\x1b[?2004h\x1b[?69$p\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[?2048$p\x1b[?u\x1b[c\x1b]11;?\x07\x1b[5n";
+    var found = false;
+    for (prefix) |b| {
+        if (p.feed(b)) |ev| {
+            switch (ev) {
+                .query_palette_color => found = true,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found);
 }

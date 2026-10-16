@@ -62,11 +62,24 @@ pub const Grid = struct {
     scroll_top: u16 = 0,
     scroll_bottom: u16 = 0, // 0 means "viewport_rows - 1" (full screen)
 
+    // Autowrap (DECAWM, CSI ?7h/l) — when false the cursor pins to the last column
+    autowrap: bool = true,
+    // Origin mode (DECOM, CSI ?36h/l) — cursor addressing relative to the region top
+    origin_mode: bool = false,
+    // Saved cursor for CSI s / CSI u (separate from the alt-screen save)
+    save_cursor_row: u16 = 0,
+    save_cursor_col: u16 = 0,
+
     // Alternate screen support
     saved_main_rows: ?[]Row = null,
     saved_cursor_row: u16 = 0,
     saved_cursor_col: u16 = 0,
     in_alt_screen: bool = false,
+
+    /// Upper bound on rows kept above the viewport (0 = unlimited).
+    /// Set by the server from config.scrollback_lines; enforced on resize so
+    /// repeated pane grow/shrink cycles cannot grow the row buffer endlessly.
+    max_scrollback_lines: usize = 0,
 
     /// Convert viewport-relative row to absolute row index in self.rows
     fn absRow(self: *const Grid, vp_row: u16) usize {
@@ -167,14 +180,20 @@ pub const Grid = struct {
 
                 // Auto-wrap: if cursor + char width exceeds right margin
                 if (self.cursor_col + w > self.cols) {
-                    self.cursor_col = 0;
-                    self.cursor_row +|= 1;
-                    if (self.cursor_row >= self.viewport_rows) {
-                        self.cursor_row = self.viewport_rows - 1;
-                        self.scrollUp(1);
-                    }
-                    if (self.getRow(self.cursor_row)) |rr| {
-                        rr.is_canonical = false;
+                    if (!self.autowrap) {
+                        // DECAWM off: overwrite the last column in place, cursor stays pinned.
+                        // vis/vim rely on this when writing a full-width status line.
+                        self.cursor_col = self.cols -| 1;
+                    } else {
+                        self.cursor_col = 0;
+                        self.cursor_row +|= 1;
+                        if (self.cursor_row >= self.viewport_rows) {
+                            self.cursor_row = self.viewport_rows - 1;
+                            self.scrollUp(1);
+                        }
+                        if (self.getRow(self.cursor_row)) |rr| {
+                            rr.is_canonical = false;
+                        }
                     }
                 }
                 if (self.getRow(self.cursor_row)) |r| {
@@ -197,10 +216,51 @@ pub const Grid = struct {
                     }
                 }
                 self.cursor_col += w;
+                if (!self.autowrap and self.cursor_col >= self.cols) {
+                    // DECAWM off: the cursor never leaves the last column
+                    self.cursor_col = self.cols -| 1;
+                }
             },
             .cursor_pos => |cp| {
-                self.cursor_row = @min(cp.row, self.viewport_rows -| 1);
-                self.cursor_col = @min(cp.col, self.cols -| 1);
+                if (self.origin_mode) {
+                    // DECOM: coordinates are relative to the scroll-region top
+                    const top = self.effectiveScrollTop();
+                    const bottom = self.effectiveScrollBottom();
+                    self.cursor_row = @min(top +| cp.row, bottom);
+                    self.cursor_col = @min(cp.col, self.cols -| 1);
+                } else {
+                    self.cursor_row = @min(cp.row, self.viewport_rows -| 1);
+                    self.cursor_col = @min(cp.col, self.cols -| 1);
+                }
+            },
+            .cursor_col_abs => |col| {
+                self.cursor_col = @min(col, self.cols -| 1);
+            },
+            .cursor_row_abs => |row| {
+                if (self.origin_mode) {
+                    const top = self.effectiveScrollTop();
+                    const bottom = self.effectiveScrollBottom();
+                    self.cursor_row = @min(top +| row, bottom);
+                } else {
+                    self.cursor_row = @min(row, self.viewport_rows -| 1);
+                }
+            },
+            .cursor_save => {
+                self.save_cursor_row = self.cursor_row;
+                self.save_cursor_col = self.cursor_col;
+            },
+            .cursor_restore => {
+                self.cursor_row = self.save_cursor_row;
+                self.cursor_col = self.save_cursor_col;
+            },
+            .set_autowrap => |on| self.autowrap = on,
+            .set_origin => |on| {
+                self.origin_mode = on;
+                if (on) {
+                    // Enabling DECOM homes the cursor into the region
+                    self.cursor_row = self.effectiveScrollTop();
+                    self.cursor_col = 0;
+                }
             },
             .cursor_move => |cm| {
                 const new_row: i32 = @as(i32, self.cursor_row) + cm.row;
@@ -213,6 +273,10 @@ pub const Grid = struct {
                 const new_row: i32 = @as(i32, self.cursor_row) + delta;
                 self.cursor_row = @intCast(@max(0, @min(new_row, @as(i32, self.viewport_rows) - 1)));
                 self.cursor_col = 0;
+            },
+            .next_line => {
+                self.cursor_col = 0;
+                _ = self.applyEvent(.linefeed);
             },
             .linefeed => {
                 const bottom = self.effectiveScrollBottom();
@@ -305,6 +369,20 @@ pub const Grid = struct {
                                 r.is_canonical = true;
                             }
                             self.cursor_row = 0;
+                        }
+                    },
+                    3 => {
+                        // Erase above (exclusive of the cursor cell)
+                        var vp_i: u16 = 0;
+                        while (vp_i < self.cursor_row) : (vp_i += 1) {
+                            if (self.getRow(vp_i)) |r| {
+                                @memset(r.cells, Cell{});
+                            }
+                        }
+                        if (self.getRow(self.cursor_row)) |r| {
+                            const ccol: usize = @intCast(self.cursor_col);
+                            const end = @min(ccol, r.cells.len);
+                            @memset(r.cells[0..end], Cell{});
                         }
                     },
                     else => {},
@@ -465,8 +543,8 @@ pub const Grid = struct {
             .scroll_region => |sr| {
                 self.scroll_top = sr.top;
                 self.scroll_bottom = sr.bottom;
-                // DECSTBM resets cursor to home position
-                self.cursor_row = 0;
+                // DECSTBM resets cursor to home position (region home in DECOM)
+                self.cursor_row = if (self.origin_mode) self.scroll_top else 0;
                 self.cursor_col = 0;
             },
             .set_title => return null, // handled externally
@@ -622,6 +700,24 @@ pub const Grid = struct {
         }
     }
 
+    /// Keep the number of rows held above the viewport within
+    /// `max_scrollback_lines` (0 = unlimited).  Only rows above the viewport
+    /// are dropped, so visible content and the cursor never move.
+    fn trimScrollback(self: *Grid) void {
+        if (self.max_scrollback_lines == 0) return;
+        const total = self.rows.items.len;
+        const vp = @as(usize, self.viewport_rows);
+        const keep = vp + self.max_scrollback_lines;
+        if (total <= keep) return;
+        const drop = total - keep;
+        var i: usize = 0;
+        while (i < drop) : (i += 1) {
+            self.rows.items[i].deinit(self.allocator);
+        }
+        std.mem.copyForwards(Row, self.rows.items[0 .. keep], self.rows.items[drop .. total]);
+        self.rows.items.len = keep;
+    }
+
     // ── Resize with Reflow ───────────────────────────────────────────────────
 
     pub fn resize(self: *Grid, new_cols: u16, new_rows: u16) !void {
@@ -643,10 +739,21 @@ pub const Grid = struct {
         } else {
             try self.resizeHeight(new_rows);
         }
+        // Both paths may have appended blank rows below the viewport; keep the
+        // scrollback buffer bounded (rows dropped are always above the viewport,
+        // so visible content and the cursor stay put).
+        self.trimScrollback();
     }
 
     fn reflow(self: *Grid, new_cols: u16, new_rows: u16) !void {
         const alloc = self.allocator;
+        const old_vp_rows = self.viewport_rows;
+        // How many rows sit hidden above the viewport before the resize.
+        // Preserving it across a reflow is what keeps the viewport anchored:
+        // history is never pulled back in, blank rows are created below the
+        // cursor instead (the reverted-resize bug).
+        const old_vp_start: usize =
+            if (self.rows.items.len > self.viewport_rows) self.rows.items.len - self.viewport_rows else 0;
 
         // Phase 1: Compute cursor's linear position
         // cursor_row is viewport-relative; convert to absolute index
@@ -754,13 +861,27 @@ pub const Grid = struct {
             current_canonical += 1;
         }
 
-        // Phase 5: Adjust to viewport height
-        while (self.rows.items.len < new_rows) {
-            try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
+        // Phase 5: Adjust to the viewport height, keeping the viewport anchored.
+        // vp_start (rows hidden above the viewport) is preserved on width
+        // changes and on vertical expansion; blank rows are appended below the
+        // cursor.  Only when the viewport itself shrinks do we let vp_start grow
+        // (content scrolls up, mirroring resizeHeight).
+        const cursor_abs_new: usize = @intCast(new_cursor_row);
+        var vp_start: usize = old_vp_start;
+        if (new_rows < old_vp_rows) {
+            vp_start = if (self.rows.items.len > new_rows) self.rows.items.len - new_rows else 0;
+        } else if (cursor_abs_new < vp_start) {
+            // Re-wrapping collapsed rows above the cursor; slide the window up
+            // just enough to keep the cursor visible.
+            vp_start = cursor_abs_new;
+        } else if (cursor_abs_new >= vp_start + new_rows) {
+            // Re-wrapping pushed rows above the cursor past the viewport bottom.
+            vp_start = cursor_abs_new + 1 - new_rows;
         }
 
-        // Remove empty trailing rows (below cursor)
-        while (self.rows.items.len > new_rows) {
+        // Drop blank trailing rows that no longer fit (never at or above the
+        // cursor, so live content is preserved).
+        while (self.rows.items.len > vp_start + new_rows) {
             const last = &self.rows.items[self.rows.items.len - 1];
             if (last.contentLen() == 0 and self.rows.items.len - 1 > new_cursor_row) {
                 var removed = self.rows.pop().?;
@@ -768,6 +889,11 @@ pub const Grid = struct {
             } else {
                 break;
             }
+        }
+
+        // Pad below the cursor so the viewport is completely filled.
+        while (self.rows.items.len < vp_start + new_rows) {
+            try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
         }
 
         // NOTE: an earlier version (commit 0245b9e) post-processed the reflowed
@@ -801,15 +927,42 @@ pub const Grid = struct {
     }
 
     fn resizeHeight(self: *Grid, new_rows: u16) !void {
-        // Add rows if total is less than the new viewport height
-        while (self.rows.items.len < new_rows) {
-            try self.rows.append(self.allocator, try Row.init(self.allocator, self.cols, true));
-        }
-        // Don't delete rows when viewport shrinks — excess rows become scrollback.
-        // The old code deleted all rows beyond new_rows (including scrollback),
-        // causing content loss on resize.
+        const alloc = self.allocator;
 
-        // Convert cursor from old viewport-relative to absolute, then back
+        if (new_rows > self.viewport_rows) {
+            // Expansion: the viewport must stay anchored where it is.  Blank
+            // rows are appended *after* the viewport (i.e. below the cursor)
+            // so vp_start — and with it every visible row and the cursor's
+            // viewport-relative row — is unchanged.  Simply letting vp_start
+            // move up would pull the missing rows back from history, which is
+            // what made a reverted resize show scrollback instead of blanks.
+            const grow: usize = @intCast(new_rows - self.viewport_rows);
+            var grown: usize = 0;
+            while (grown < grow) {
+                var blank = Row.init(alloc, self.cols, true) catch break;
+                self.rows.append(alloc, blank) catch {
+                    blank.deinit(alloc);
+                    break;
+                };
+                grown += 1;
+            }
+            self.viewport_rows = new_rows;
+            // OOM mid-expansion: never let viewport_rows exceed the rows we
+            // actually hold, otherwise vp_start would point past the buffer.
+            if (self.rows.items.len < self.viewport_rows) {
+                self.viewport_rows =
+                    @intCast(@min(self.rows.items.len, std.math.maxInt(u16)));
+            }
+            return;
+        }
+
+        // Safety pad: the buffer must be able to fill the viewport
+        while (self.rows.items.len < new_rows) {
+            try self.rows.append(alloc, try Row.init(alloc, self.cols, true));
+        }
+
+        // Shrink (or same height): rows are kept — the excess above the
+        // viewport become scrollback (content scrolls up, nothing is lost).
         const old_abs = self.absRow(self.cursor_row);
         self.viewport_rows = new_rows;
         const total = self.rows.items.len;
@@ -1007,4 +1160,184 @@ test "reflow preserves content through narrow-wide cycle" {
     try std.testing.expectEqual(@as(u21, 'd'), grid.getCell(0, 10).char);
     // After 'd', rest should be spaces
     try std.testing.expectEqual(@as(u21, ' '), grid.getCell(0, 11).char);
+}
+
+test "autowrap off pins the cursor to the last column" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 3);
+    defer grid.deinit();
+
+    _ = grid.applyEvent(.{ .set_autowrap = false });
+    // Write 13 chars into a 10-column row: everything lands on row 0, the last
+    // column is overwritten instead of wrapping (this is what vis depends on).
+    for ("ABCDEFGHIJKLM") |ch| {
+        _ = grid.applyEvent(.{ .print = ch });
+    }
+    try std.testing.expectEqual(@as(u21, 'A'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'M'), grid.getCell(0, 9).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u16, 9), grid.cursor_col);
+}
+
+test "VPA and HPA move the cursor absolutely" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 20, 5);
+    defer grid.deinit();
+
+    _ = grid.applyEvent(.{ .cursor_row_abs = 3 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 7 });
+    try std.testing.expectEqual(@as(u16, 3), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 7), grid.cursor_col);
+
+    _ = grid.applyEvent(.{ .print = 'x' });
+    try std.testing.expectEqual(@as(u21, 'x'), grid.getCell(3, 7).char);
+}
+
+test "CSI s / CSI u round-trip the cursor" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 20, 5);
+    defer grid.deinit();
+
+    _ = grid.applyEvent(.{ .cursor_row_abs = 2 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 4 });
+    _ = grid.applyEvent(.cursor_save);
+    _ = grid.applyEvent(.{ .cursor_row_abs = 0 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 0 });
+    _ = grid.applyEvent(.cursor_restore);
+    try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_col);
+}
+
+test "linefeed at scroll region bottom scrolls the region" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+
+    // Fill rows 0..5 with "L0".."L5"
+    var r: u16 = 0;
+    while (r < 6) : (r += 1) {
+        _ = grid.applyEvent(.{ .cursor_row_abs = r });
+        _ = grid.applyEvent(.{ .cursor_col_abs = 0 });
+        _ = grid.applyEvent(.{ .print = 'L' });
+        _ = grid.applyEvent(.{ .print = '0' + r });
+    }
+
+    // Set scroll region rows 1..5 (0-based 0..4)
+    _ = grid.applyEvent(.{ .scroll_region = .{ .top = 0, .bottom = 4 } });
+
+    // Cursor back to region bottom (row 4)
+    _ = grid.applyEvent(.{ .cursor_row_abs = 4 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 0 });
+
+    // Linefeed at the bottom of the region must scroll the region up by one.
+    _ = grid.applyEvent(.linefeed);
+
+    // Row 5 (outside region) keeps its content; row 0 now holds old row 1.
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    // The freed region bottom row is blank.
+    try std.testing.expectEqual(@as(u21, ' '), grid.getCell(4, 0).char);
+}
+
+test "ESC 7 / ESC 8 save and restore the cursor (vis scroll pattern)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    // Six numbered lines, then the vis idiom: set the scroll region, save the
+    // cursor at the region bottom, restore it, and emit a plain newline.  The
+    // newline at the region bottom must scroll the region up.
+    const script = "\x1b[1dL0\r\x1b[2dL1\r\x1b[3dL2\r\x1b[4dL3\r\x1b[5dL4\r\x1b[6dL5\r"
+        ++ "\x1b[1;5r\x1b7\x1b8\x1b[5d\n"
+        ++ "\x1b[1;6r\x1b[5dX";
+    for (script) |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.getCell(4, 0).char);
+}
+
+test "ESC 7 saves and ESC 8 restores an arbitrary cursor position" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    for ("\x1b[3;4H\x1b7\x1b[1;1H\x1b8X") |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_col);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.getCell(2, 3).char);
+}
+
+test "ESC E (next line) moves down and to column 0" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    for ("\x1b[3;5H\x1bE") |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u16, 3), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_col);
+}
+
+test "ESC D (index) scrolls at the scroll-region bottom" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    const script = "\x1b[1dL0\r\x1b[2dL1\r\x1b[3dL2\r\x1b[4dL3\r\x1b[5dL4\r\x1b[6dL5\r\x1b[1;5r\x1b[5d\x1bD";
+    for (script) |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+}
+
+test "parser-driven region scroll at region bottom (vis pattern)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    const script = "\x1b[1dL0\r\x1b[2dL1\r\x1b[3dL2\r\x1b[4dL3\r\x1b[5dL4\r\x1b[6dL5\r"
+        ++ "\x1b[1;5r\x1b7\x1b8\x1b[5d\n"
+        ++ "\x1b[1;6r\x1b[5dX";
+    for (script) |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    // After the LF at the region bottom (row 5, 1-based) the region 1..5 scrolled
+    // up: old row 2 is now at row 1, row 5 is blank, row 6 untouched.
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.getCell(4, 0).char);
 }
