@@ -68,6 +68,11 @@ pub const Grid = struct {
     saved_cursor_col: u16 = 0,
     in_alt_screen: bool = false,
 
+    /// Upper bound on rows kept above the viewport (0 = unlimited).
+    /// Set by the server from config.scrollback_lines; enforced on resize so
+    /// repeated pane grow/shrink cycles cannot grow the row buffer endlessly.
+    max_scrollback_lines: usize = 0,
+
     /// Convert viewport-relative row to absolute row index in self.rows
     fn absRow(self: *const Grid, vp_row: u16) usize {
         const total: usize = self.rows.items.len;
@@ -622,6 +627,24 @@ pub const Grid = struct {
         }
     }
 
+    /// Keep the number of rows held above the viewport within
+    /// `max_scrollback_lines` (0 = unlimited).  Only rows above the viewport
+    /// are dropped, so visible content and the cursor never move.
+    fn trimScrollback(self: *Grid) void {
+        if (self.max_scrollback_lines == 0) return;
+        const total = self.rows.items.len;
+        const vp = @as(usize, self.viewport_rows);
+        const keep = vp + self.max_scrollback_lines;
+        if (total <= keep) return;
+        const drop = total - keep;
+        var i: usize = 0;
+        while (i < drop) : (i += 1) {
+            self.rows.items[i].deinit(self.allocator);
+        }
+        std.mem.copyForwards(Row, self.rows.items[0 .. keep], self.rows.items[drop .. total]);
+        self.rows.items.len = keep;
+    }
+
     // ── Resize with Reflow ───────────────────────────────────────────────────
 
     pub fn resize(self: *Grid, new_cols: u16, new_rows: u16) !void {
@@ -643,10 +666,21 @@ pub const Grid = struct {
         } else {
             try self.resizeHeight(new_rows);
         }
+        // Both paths may have appended blank rows below the viewport; keep the
+        // scrollback buffer bounded (rows dropped are always above the viewport,
+        // so visible content and the cursor stay put).
+        self.trimScrollback();
     }
 
     fn reflow(self: *Grid, new_cols: u16, new_rows: u16) !void {
         const alloc = self.allocator;
+        const old_vp_rows = self.viewport_rows;
+        // How many rows sit hidden above the viewport before the resize.
+        // Preserving it across a reflow is what keeps the viewport anchored:
+        // history is never pulled back in, blank rows are created below the
+        // cursor instead (the reverted-resize bug).
+        const old_vp_start: usize =
+            if (self.rows.items.len > self.viewport_rows) self.rows.items.len - self.viewport_rows else 0;
 
         // Phase 1: Compute cursor's linear position
         // cursor_row is viewport-relative; convert to absolute index
@@ -754,13 +788,27 @@ pub const Grid = struct {
             current_canonical += 1;
         }
 
-        // Phase 5: Adjust to viewport height
-        while (self.rows.items.len < new_rows) {
-            try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
+        // Phase 5: Adjust to the viewport height, keeping the viewport anchored.
+        // vp_start (rows hidden above the viewport) is preserved on width
+        // changes and on vertical expansion; blank rows are appended below the
+        // cursor.  Only when the viewport itself shrinks do we let vp_start grow
+        // (content scrolls up, mirroring resizeHeight).
+        const cursor_abs_new: usize = @intCast(new_cursor_row);
+        var vp_start: usize = old_vp_start;
+        if (new_rows < old_vp_rows) {
+            vp_start = if (self.rows.items.len > new_rows) self.rows.items.len - new_rows else 0;
+        } else if (cursor_abs_new < vp_start) {
+            // Re-wrapping collapsed rows above the cursor; slide the window up
+            // just enough to keep the cursor visible.
+            vp_start = cursor_abs_new;
+        } else if (cursor_abs_new >= vp_start + new_rows) {
+            // Re-wrapping pushed rows above the cursor past the viewport bottom.
+            vp_start = cursor_abs_new + 1 - new_rows;
         }
 
-        // Remove empty trailing rows (below cursor)
-        while (self.rows.items.len > new_rows) {
+        // Drop blank trailing rows that no longer fit (never at or above the
+        // cursor, so live content is preserved).
+        while (self.rows.items.len > vp_start + new_rows) {
             const last = &self.rows.items[self.rows.items.len - 1];
             if (last.contentLen() == 0 and self.rows.items.len - 1 > new_cursor_row) {
                 var removed = self.rows.pop().?;
@@ -768,6 +816,11 @@ pub const Grid = struct {
             } else {
                 break;
             }
+        }
+
+        // Pad below the cursor so the viewport is completely filled.
+        while (self.rows.items.len < vp_start + new_rows) {
+            try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
         }
 
         // NOTE: an earlier version (commit 0245b9e) post-processed the reflowed
@@ -801,15 +854,42 @@ pub const Grid = struct {
     }
 
     fn resizeHeight(self: *Grid, new_rows: u16) !void {
-        // Add rows if total is less than the new viewport height
-        while (self.rows.items.len < new_rows) {
-            try self.rows.append(self.allocator, try Row.init(self.allocator, self.cols, true));
-        }
-        // Don't delete rows when viewport shrinks — excess rows become scrollback.
-        // The old code deleted all rows beyond new_rows (including scrollback),
-        // causing content loss on resize.
+        const alloc = self.allocator;
 
-        // Convert cursor from old viewport-relative to absolute, then back
+        if (new_rows > self.viewport_rows) {
+            // Expansion: the viewport must stay anchored where it is.  Blank
+            // rows are appended *after* the viewport (i.e. below the cursor)
+            // so vp_start — and with it every visible row and the cursor's
+            // viewport-relative row — is unchanged.  Simply letting vp_start
+            // move up would pull the missing rows back from history, which is
+            // what made a reverted resize show scrollback instead of blanks.
+            const grow: usize = @intCast(new_rows - self.viewport_rows);
+            var grown: usize = 0;
+            while (grown < grow) {
+                var blank = Row.init(alloc, self.cols, true) catch break;
+                self.rows.append(alloc, blank) catch {
+                    blank.deinit(alloc);
+                    break;
+                };
+                grown += 1;
+            }
+            self.viewport_rows = new_rows;
+            // OOM mid-expansion: never let viewport_rows exceed the rows we
+            // actually hold, otherwise vp_start would point past the buffer.
+            if (self.rows.items.len < self.viewport_rows) {
+                self.viewport_rows =
+                    @intCast(@min(self.rows.items.len, std.math.maxInt(u16)));
+            }
+            return;
+        }
+
+        // Safety pad: the buffer must be able to fill the viewport
+        while (self.rows.items.len < new_rows) {
+            try self.rows.append(alloc, try Row.init(alloc, self.cols, true));
+        }
+
+        // Shrink (or same height): rows are kept — the excess above the
+        // viewport become scrollback (content scrolls up, nothing is lost).
         const old_abs = self.absRow(self.cursor_row);
         self.viewport_rows = new_rows;
         const total = self.rows.items.len;

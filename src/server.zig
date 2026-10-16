@@ -781,6 +781,9 @@ pub const Server = struct {
 
         var grid = try grid_mod.Grid.init(self.allocator, init_cols, init_rows);
         errdefer grid.deinit();
+        // Bound the rows the grid keeps above the viewport (pane resizes push
+        // rows into scrollback; without a cap they would grow unboundedly).
+        grid.max_scrollback_lines = @as(usize, sb_lines);
 
         const state = try self.allocator.create(PaneState);
         errdefer self.allocator.destroy(state);

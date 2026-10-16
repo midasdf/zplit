@@ -45,6 +45,13 @@ zig build -Doptimize=ReleaseSmall
 # Binary at zig-out/bin/zplit (<100KB)
 ```
 
+#### System-wide
+
+```bash
+zig build -Doptimize=ReleaseSmall
+install -m 755 ./zig-out/bin/zplit $HOME/.local/bin/zplit
+```
+
 ### Cross-compile for ARM
 
 ```bash
